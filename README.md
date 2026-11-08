@@ -1,5 +1,7 @@
 # X-Plane 12 SeeYou Navigator Integration
 
+![The plugin's status window in the ASK 21, climbing in a thermal near Lake Zurich in X-Plane 12](docs/cover.jpg)
+
 Bridge that connects [X-Plane 12](https://www.x-plane.com/) to [SeeYou Navigator](https://naviter.com/seeyou-navigator/) through a serial COM port and the [Naviter USB dongle](https://naviter.com/) (Silicon Labs CP210x).
 
 The bridge reads the aircraft state from X-Plane, turns it into NMEA sentences and writes them to the dongle, the same way Condor 3 does. SeeYou Navigator on your phone treats X-Plane as if it were Condor.
