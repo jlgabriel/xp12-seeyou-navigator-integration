@@ -8,6 +8,7 @@ import time
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 
 _spec = importlib.util.spec_from_file_location(
@@ -17,7 +18,9 @@ _spec.loader.exec_module(bridge)
 
 from fake_xplane import FakeXPlane, GliderModel  # noqa: E402
 
-NMEA = bridge.NMEAConverter
+from xp12_seeyou import core  # noqa: E402
+
+NMEA = core.NMEAConverter
 
 
 def sample_flight(**overrides):
@@ -28,7 +31,7 @@ def sample_flight(**overrides):
         wind_speed_ms=0.0, zulu_sec=17 * 3600 + 0.021,
     )
     values.update(overrides)
-    return bridge.FlightData(**values)
+    return core.FlightData(**values)
 
 
 class ListWriter:
@@ -100,7 +103,7 @@ class TestNMEAFormat(unittest.TestCase):
         self.assertRegex(gga.split(",")[1], r"^\d{6}\.\d{3}$")
 
     def test_no_position_no_sentences(self):
-        self.assertEqual(NMEA().create_sentences(bridge.FlightData()), [])
+        self.assertEqual(NMEA().create_sentences(core.FlightData()), [])
 
 
 class TestRREF(unittest.TestCase):
@@ -119,20 +122,20 @@ class TestRREF(unittest.TestCase):
         self.assertEqual(bridge.XPlaneReceiver.parse_rref_packet(b"DATA*xxxx"), [])
 
     def test_all_datarefs_fit(self):
-        for _, path in bridge.DATAREFS:
+        for _, path, _ in core.DATAREFS:
             self.assertLess(len(path), 400)
 
 
 class TestHelpers(unittest.TestCase):
 
     def test_track_from_ogl_velocity(self):
-        self.assertAlmostEqual(bridge.track_from_velocity(0, -10), 0.0)    # north = -z
-        self.assertAlmostEqual(bridge.track_from_velocity(10, 0), 90.0)
-        self.assertAlmostEqual(bridge.track_from_velocity(0, 10), 180.0)
-        self.assertAlmostEqual(bridge.track_from_velocity(-10, 0), 270.0)
+        self.assertAlmostEqual(core.track_from_velocity(0, -10), 0.0)    # north = -z
+        self.assertAlmostEqual(core.track_from_velocity(10, 0), 90.0)
+        self.assertAlmostEqual(core.track_from_velocity(0, 10), 180.0)
+        self.assertAlmostEqual(core.track_from_velocity(-10, 0), 270.0)
 
     def test_vario_auto_falls_back_when_te_is_dead(self):
-        selector = bridge.VarioSelector("auto")
+        selector = core.VarioSelector("auto")
         for t in range(5):
             selector.observe(float(t), 0.0, 2.0)
         self.assertEqual(selector.source, "raw")
@@ -140,13 +143,13 @@ class TestHelpers(unittest.TestCase):
         self.assertEqual(selector.source, "te")
 
     def test_vario_auto_keeps_te_in_level_flight(self):
-        selector = bridge.VarioSelector("auto")
+        selector = core.VarioSelector("auto")
         for t in range(10):
             selector.observe(float(t), 0.0, 0.1)
         self.assertEqual(selector.source, "te")
 
     def test_rolling_mean_window(self):
-        mean = bridge.RollingMean(1.0)
+        mean = core.RollingMean(1.0)
         mean.add(0.0, 10.0)
         mean.add(0.5, 2.0)
         mean.add(1.4, 4.0)

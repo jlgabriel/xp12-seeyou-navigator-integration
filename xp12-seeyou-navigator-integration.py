@@ -4,7 +4,7 @@
 # This software is released under the MIT License.
 
 """
-Bridge between X-Plane 12 and SeeYou Navigator via serial COM port.
+Bridge between X-Plane 12 and SeeYou Navigator via serial COM port (standalone app).
 
 This program:
 1. Subscribes to X-Plane datarefs over UDP (RREF protocol, port 49000).
@@ -15,182 +15,42 @@ This program:
 
 The NMEA output matches what Condor 3 sends to the Naviter dongle,
 so SeeYou Navigator treats X-Plane like Condor.
+
+The same bridge also exists as an XPPython3 plugin (plugin/PI_xp12_seeyou_navigator.py);
+both share the `xp12_seeyou` package.
 """
 
 import argparse
-import datetime
 import json
-import math
 import os
 import socket
 import struct
 import sys
 import threading
 import time
-from collections import deque
-from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
-try:
-    import serial
-    import serial.tools.list_ports
-    HAS_PYSERIAL = True
-except ImportError:
-    HAS_PYSERIAL = False
-
-VERSION = "1.0.0"
+from xp12_seeyou import VERSION
+from xp12_seeyou.core import (
+    BARO_MODES, BAUD_RATES, DATAREFS, DEFAULT_BAUDRATE, DEFAULT_COM_PORT,
+    DEFAULT_UPDATE_RATE, FT_TO_M, MS_TO_KPH, MS_TO_KTS, TIME_SOURCES, VARIO_MODES,
+    FlightData, NMEAConverter, VarioTracker, build_flight_data,
+)
+from xp12_seeyou.serial_out import (
+    HAS_PYSERIAL, ConsoleWriter, SerialWriter, find_naviter_dongle,
+    list_ports_detailed,
+)
 
 # ── Configuration ────────────────────────────────────────────────────
 
 DEFAULT_XP_HOST = "127.0.0.1"     # X-Plane machine (localhost or LAN IP)
 DEFAULT_XP_PORT = 49000           # X-Plane UDP receive port
 DEFAULT_RREF_FREQ = 10            # Dataref updates per second requested from X-Plane
-DEFAULT_COM_PORT = "COM7"         # Default serial port (Naviter dongle)
-DEFAULT_BAUDRATE = 4800           # NMEA standard baud rate (same as Condor 3)
-DEFAULT_UPDATE_RATE = 1.0         # NMEA output rate in Hz (same as Condor 3)
 DEFAULT_DEBUG_LEVEL = 1           # 0=minimal, 1=normal, 2=verbose
-BAUD_RATES = (4800, 9600, 19200, 38400)
-
-BARO_MODES = ("msl", "pressure")  # LXWP0 altitude: true MSL (Condor) or pressure alt (LX)
-TIME_SOURCES = ("sim", "system")  # NMEA UTC time: X-Plane zulu time (Condor) or PC clock
-VARIO_MODES = ("auto", "te", "raw")
-
-# Naviter dongle = Silicon Labs CP210x USB to UART bridge
-NAVITER_DONGLE_VID = 0x10C4
-NAVITER_DONGLE_PID = 0xEA60
-
-MS_TO_KPH = 3.6
-MS_TO_KTS = 1.9438445
-KTS_TO_MS = 0.5144444
-FT_TO_M = 0.3048
-FPM_TO_MS = 0.00508
 
 SETTINGS_DIR_NAME = "xp12-seeyou-bridge"
 
-# Datarefs requested from X-Plane. The list index is the RREF index.
-# All of them exist in X-Plane 12 (checked against DataRefs.txt of 12.4).
-DATAREFS: List[Tuple[str, str]] = [
-    ("lat",             "sim/flightmodel/position/latitude"),                 # deg
-    ("lon",             "sim/flightmodel/position/longitude"),                # deg
-    ("elev_m",          "sim/flightmodel/position/elevation"),                # m MSL
-    ("pressure_alt_ft", "sim/flightmodel2/position/pressure_altitude"),       # ft (QNE)
-    ("agl_m",           "sim/flightmodel/position/y_agl"),                    # m
-    ("gs_ms",           "sim/flightmodel/position/groundspeed"),              # m/s
-    ("vx",              "sim/flightmodel/position/local_vx"),                 # m/s, OGL +x = east
-    ("vz",              "sim/flightmodel/position/local_vz"),                 # m/s, OGL +z = south
-    ("true_psi",        "sim/flightmodel/position/true_psi"),                 # deg true
-    ("mag_var",         "sim/flightmodel/position/magnetic_variation"),       # deg
-    ("ias_kt",          "sim/flightmodel/position/indicated_airspeed"),       # kias
-    ("tas_ms",          "sim/flightmodel/position/true_airspeed"),            # m/s
-    ("vs_ms",           "sim/flightmodel/position/vh_ind"),                   # m/s
-    ("te_fpm",          "sim/cockpit2/gauges/indicators/total_energy_fpm"),   # ft/min
-    ("wind_dir",        "sim/weather/aircraft/wind_now_direction_degt"),      # deg true, FROM
-    ("wind_ms",         "sim/weather/aircraft/wind_now_speed_msc"),           # m/s
-    ("zulu_sec",        "sim/time/zulu_time_sec"),                            # s since midnight
-    ("paused",          "sim/time/paused"),                                   # 0/1
-]
-KEY_INDEX: Dict[str, int] = {key: i for i, (key, _) in enumerate(DATAREFS)}
-
-# ── Data classes ─────────────────────────────────────────────────────
-
-@dataclass(frozen=True)
-class FlightData:
-    """Snapshot of the aircraft state, already converted to SI units."""
-    timestamp: float = 0.0                      # PC time of the last X-Plane packet
-    latitude: float = 0.0
-    longitude: float = 0.0
-    altitude_msl_m: float = 0.0
-    pressure_altitude_m: Optional[float] = None
-    agl_m: Optional[float] = None
-    ground_speed_ms: float = 0.0
-    track_deg: float = 0.0
-    heading_deg: float = 0.0
-    magnetic_variation: Optional[float] = None
-    ias_ms: Optional[float] = None
-    tas_ms: Optional[float] = None
-    vario_ms: Optional[float] = None            # selected source, averaged over 1 s
-    vario_avg_ms: Optional[float] = None        # selected source, averaged over 30 s
-    vario_source: str = "---"
-    wind_dir_deg: Optional[float] = None        # direction the wind blows FROM
-    wind_speed_ms: Optional[float] = None
-    zulu_sec: Optional[float] = None
-    paused: bool = False
-
-    @property
-    def has_position(self) -> bool:
-        return self.timestamp > 0 and not (self.latitude == 0.0 and self.longitude == 0.0)
-
-# ── Helpers ──────────────────────────────────────────────────────────
-
-class RollingMean:
-    """Mean of the samples received in the last `window` seconds."""
-
-    def __init__(self, window: float):
-        self.window = window
-        self._samples: deque = deque()
-
-    def add(self, t: float, value: float) -> None:
-        self._samples.append((t, value))
-        cutoff = t - self.window
-        while self._samples and self._samples[0][0] < cutoff:
-            self._samples.popleft()
-
-    def mean(self) -> Optional[float]:
-        if not self._samples:
-            return None
-        return sum(v for _, v in self._samples) / len(self._samples)
-
-    def clear(self) -> None:
-        self._samples.clear()
-
-
-class VarioSelector:
-    """
-    Chooses between the total-energy vario and the raw vertical speed.
-
-    'te' and 'raw' are fixed. 'auto' prefers total energy, but falls back to raw
-    if the TE dataref stays at exactly 0 while the aircraft is clearly climbing
-    or sinking (an aircraft whose TE gauge is not simulated).
-    """
-    DEAD_TE_SECONDS = 3.0
-    RAW_THRESHOLD_MS = 0.3
-
-    def __init__(self, mode: str = "auto"):
-        if mode not in VARIO_MODES:
-            raise ValueError(f"Unknown vario mode: {mode}")
-        self.mode = mode
-        self.te_dead = False
-        self._te_zero_since: Optional[float] = None
-
-    def observe(self, t: float, te_ms: float, raw_ms: float) -> None:
-        if te_ms == 0.0 and abs(raw_ms) > self.RAW_THRESHOLD_MS:
-            if self._te_zero_since is None:
-                self._te_zero_since = t
-            elif t - self._te_zero_since >= self.DEAD_TE_SECONDS:
-                self.te_dead = True
-        elif te_ms != 0.0:
-            self._te_zero_since = None
-            self.te_dead = False
-
-    @property
-    def source(self) -> str:
-        if self.mode == "raw" or (self.mode == "auto" and self.te_dead):
-            return "raw"
-        return "te"
-
-
-def track_from_velocity(vx: float, vz: float) -> float:
-    """Ground track in degrees true from X-Plane local OGL velocity (+x east, +z south)."""
-    return math.degrees(math.atan2(vx, -vz)) % 360.0
-
-
-def ias_to_tas(ias_ms: float, altitude_m: float) -> float:
-    """IAS to TAS with the ISA troposphere model (only used as a fallback)."""
-    h = max(0.0, min(altitude_m, 11000.0))
-    t = 288.15 - 0.0065 * h
-    density_ratio = (t / 288.15) ** (9.80665 / (287.058 * 0.0065) - 1.0)
-    return ias_ms / math.sqrt(density_ratio)
-
+# ── Settings ─────────────────────────────────────────────────────────
 
 def settings_path() -> str:
     base = os.environ.get("APPDATA") or os.path.expanduser("~")
@@ -235,13 +95,11 @@ class XPlaneReceiver:
         self.port = port
         self.freq = freq
         self.debug_level = debug_level
-        self.vario_selector = VarioSelector(vario_mode)
+        self.vario = VarioTracker(vario_mode)
         self._sock: Optional[socket.socket] = None
         self._thread: Optional[threading.Thread] = None
         self._lock = threading.Lock()
-        self._values: Dict[int, float] = {}
-        self._vario = {"te": RollingMean(1.0), "raw": RollingMean(1.0)}
-        self._vario_avg = {"te": RollingMean(30.0), "raw": RollingMean(30.0)}
+        self._values: Dict[str, float] = {}
         self.running = False
         self.last_receive_time = 0.0
         self.packets_received = 0
@@ -291,7 +149,7 @@ class XPlaneReceiver:
             self._sock = None
 
     def _subscribe(self, freq: int):
-        for i, (_, path) in enumerate(DATAREFS):
+        for i, (_, path, _) in enumerate(DATAREFS):
             try:
                 self._sock.sendto(self.build_rref_request(freq, i, path), (self.host, self.port))
             except OSError as e:
@@ -324,20 +182,10 @@ class XPlaneReceiver:
         with self._lock:
             for index, value in pairs:
                 if 0 <= index < len(DATAREFS):
-                    self._values[index] = value
+                    self._values[DATAREFS[index][0]] = value
             self.last_receive_time = now
             self.packets_received += 1
-
-            te_fpm = self._values.get(KEY_INDEX["te_fpm"])
-            vs_ms = self._values.get(KEY_INDEX["vs_ms"])
-            paused = self._values.get(KEY_INDEX["paused"], 0.0) >= 0.5
-            if te_fpm is None or vs_ms is None or paused:
-                return
-            te_ms = te_fpm * FPM_TO_MS
-            self.vario_selector.observe(now, te_ms, vs_ms)
-            for source, value in (("te", te_ms), ("raw", vs_ms)):
-                self._vario[source].add(now, value)
-                self._vario_avg[source].add(now, value)
+            self.vario.add_from_values(now, self._values)
 
     # Data access -------------------------------------------------------
 
@@ -346,269 +194,7 @@ class XPlaneReceiver:
 
     def snapshot(self) -> FlightData:
         with self._lock:
-            values = dict(self._values)
-            timestamp = self.last_receive_time
-            source = self.vario_selector.source
-            vario = self._vario[source].mean()
-            vario_avg = self._vario_avg[source].mean()
-
-        def get(key: str) -> Optional[float]:
-            return values.get(KEY_INDEX[key])
-
-        if timestamp == 0 or get("lat") is None or get("lon") is None:
-            return FlightData()
-
-        gs = get("gs_ms") or 0.0
-        heading = (get("true_psi") or 0.0) % 360.0
-        vx, vz = get("vx"), get("vz")
-        if gs > 1.0 and vx is not None and vz is not None:
-            track = track_from_velocity(vx, vz)
-        else:
-            track = heading  # on the ground / hovering: velocity direction is noise
-        pressure_alt_ft = get("pressure_alt_ft")
-        ias_kt = get("ias_kt")
-        tas = get("tas_ms")
-        elev = get("elev_m") or 0.0
-        if tas is None and ias_kt is not None:
-            tas = ias_to_tas(ias_kt * KTS_TO_MS, elev)
-
-        return FlightData(
-            timestamp=timestamp,
-            latitude=get("lat"),
-            longitude=get("lon"),
-            altitude_msl_m=elev,
-            pressure_altitude_m=pressure_alt_ft * FT_TO_M if pressure_alt_ft is not None else None,
-            agl_m=get("agl_m"),
-            ground_speed_ms=gs,
-            track_deg=track,
-            heading_deg=heading,
-            magnetic_variation=get("mag_var"),
-            ias_ms=ias_kt * KTS_TO_MS if ias_kt is not None else None,
-            tas_ms=tas,
-            vario_ms=vario,
-            vario_avg_ms=vario_avg,
-            vario_source=source.upper() if vario is not None else "---",
-            wind_dir_deg=get("wind_dir"),
-            wind_speed_ms=get("wind_ms"),
-            zulu_sec=get("zulu_sec"),
-            paused=(get("paused") or 0.0) >= 0.5,
-        )
-
-# ── NMEA Converter ────────────────────────────────────────────────────
-
-class NMEAConverter:
-    """Builds the three sentences Condor 3 sends to the Naviter dongle."""
-
-    def __init__(self, baro_mode: str = "msl", time_source: str = "sim"):
-        if baro_mode not in BARO_MODES:
-            raise ValueError(f"Unknown baro mode: {baro_mode}")
-        if time_source not in TIME_SOURCES:
-            raise ValueError(f"Unknown time source: {time_source}")
-        self.baro_mode = baro_mode
-        self.time_source = time_source
-
-    def create_sentences(self, fd: FlightData) -> List[str]:
-        """Order matches Condor 3: GPGGA, GPRMC, LXWP0."""
-        if not fd.has_position:
-            return []
-        time_str = self._time_string(fd)
-        return [
-            self._gga(fd, time_str),
-            self._rmc(fd, time_str),
-            self._lxwp0(fd),
-        ]
-
-    def _time_string(self, fd: FlightData) -> str:
-        """hhmmss.sss — Condor 3 sends simulator time, so 'sim' is the default."""
-        if self.time_source == "sim" and fd.zulu_sec is not None:
-            total_ms = int(round(fd.zulu_sec * 1000)) % 86_400_000
-        else:
-            now = datetime.datetime.now(datetime.timezone.utc)
-            total_ms = ((now.hour * 60 + now.minute) * 60 + now.second) * 1000 \
-                + now.microsecond // 1000
-        seconds, ms = divmod(total_ms, 1000)
-        h, rem = divmod(seconds, 3600)
-        m, s = divmod(rem, 60)
-        return f"{h:02d}{m:02d}{s:02d}.{ms:03d}"
-
-    def _gga(self, fd: FlightData, time_str: str) -> str:
-        lat, ns = self.latitude_to_nmea(fd.latitude)
-        lon, ew = self.longitude_to_nmea(fd.longitude)
-        # Condor 3: 12 satellites, HDOP 10, empty geoid/DGPS fields, trailing 0000
-        return self.wrap(",".join([
-            "GPGGA", time_str, lat, ns, lon, ew,
-            "1", "12", "10", f"{fd.altitude_msl_m:.1f}", "M",
-            "", "", "", "", "0000",
-        ]))
-
-    def _rmc(self, fd: FlightData, time_str: str) -> str:
-        lat, ns = self.latitude_to_nmea(fd.latitude)
-        lon, ew = self.longitude_to_nmea(fd.longitude)
-        # Condor 3: empty date, magnetic variation and mode fields
-        return self.wrap(",".join([
-            "GPRMC", time_str, "A", lat, ns, lon, ew,
-            f"{fd.ground_speed_ms * MS_TO_KTS:.2f}", f"{fd.track_deg:.2f}",
-            "", "", "", "",
-        ]))
-
-    def _lxwp0(self, fd: FlightData) -> str:
-        """$LXWP0,Y,<TAS kph>,<baro alt m>,<vario m/s>,,,,,,<heading>,<wind dir>,<wind kph>"""
-        tas = fd.tas_ms if fd.tas_ms is not None else fd.ground_speed_ms
-        if self.baro_mode == "pressure" and fd.pressure_altitude_m is not None:
-            baro_alt = fd.pressure_altitude_m
-        else:
-            baro_alt = fd.altitude_msl_m
-        vario = fd.vario_ms if fd.vario_ms is not None else 0.0
-        wind_dir = fd.wind_dir_deg if fd.wind_dir_deg is not None else 0.0
-        wind_kph = (fd.wind_speed_ms or 0.0) * MS_TO_KPH
-        return self.wrap(",".join([
-            "LXWP0", "Y", f"{tas * MS_TO_KPH:.1f}", f"{baro_alt:.1f}", f"{vario:.2f}",
-            "", "", "", "", "",
-            f"{self.whole_degrees(fd.heading_deg)}",
-            f"{self.whole_degrees(wind_dir)}",
-            f"{wind_kph:.1f}",
-        ]))
-
-    @staticmethod
-    def whole_degrees(angle: float) -> int:
-        return int(round(angle)) % 360
-
-    @staticmethod
-    def _to_nmea(value: float, deg_width: int) -> str:
-        # Round to 1/10000 minute first so 59.99999' never prints as "60.0000"
-        total = int(round(abs(value) * 60 * 10000))
-        degrees, rest = divmod(total, 60 * 10000)
-        return f"{degrees:0{deg_width}d}{rest / 10000:07.4f}"
-
-    @classmethod
-    def latitude_to_nmea(cls, latitude: float) -> Tuple[str, str]:
-        return cls._to_nmea(latitude, 2), ("S" if latitude < 0 else "N")
-
-    @classmethod
-    def longitude_to_nmea(cls, longitude: float) -> Tuple[str, str]:
-        return cls._to_nmea(longitude, 3), ("W" if longitude < 0 else "E")
-
-    @staticmethod
-    def checksum(body: str) -> str:
-        value = 0
-        for char in body:
-            value ^= ord(char)
-        return f"{value:02X}"
-
-    @classmethod
-    def wrap(cls, body: str) -> str:
-        return f"${body}*{cls.checksum(body)}"
-
-# ── Output writers ───────────────────────────────────────────────────
-
-class SerialWriter:
-    """Writes NMEA sentences to the COM port of the Naviter dongle."""
-
-    RECONNECT_INTERVAL = 3.0
-
-    def __init__(self, port: str = DEFAULT_COM_PORT, baudrate: int = DEFAULT_BAUDRATE,
-                 debug_level: int = DEFAULT_DEBUG_LEVEL):
-        self.port = port
-        self.baudrate = baudrate
-        self.debug_level = debug_level
-        self._serial = None
-        self._lock = threading.Lock()
-
-    def start(self):
-        self._connect()
-
-    def _connect(self) -> bool:
-        try:
-            self._serial = serial.Serial(
-                port=self.port, baudrate=self.baudrate,
-                bytesize=serial.EIGHTBITS, parity=serial.PARITY_NONE,
-                stopbits=serial.STOPBITS_ONE, timeout=1, write_timeout=1,
-            )
-            print(f"Serial port {self.port} opened at {self.baudrate} baud")
-            return True
-        except serial.SerialException as e:
-            if self.debug_level >= 1:
-                print(f"Could not open {self.port}: {e}")
-            self._serial = None
-            return False
-
-    def is_connected(self) -> bool:
-        return self._serial is not None and self._serial.is_open
-
-    def send_batch(self, sentences: List[str]) -> bool:
-        """Write all sentences of one cycle in a single call, each ended with CR+LF."""
-        if not self.is_connected() or not sentences:
-            return False
-        payload = "".join(s + "\r\n" for s in sentences).encode("ascii")
-        with self._lock:
-            try:
-                self._serial.write(payload)
-                return True
-            except serial.SerialException as e:
-                if self.debug_level >= 1:
-                    print(f"Serial write error: {e}")
-                self._close()
-                return False
-
-    def reconnect(self):
-        with self._lock:
-            self._close()
-        self._connect()
-
-    def _close(self):
-        if self._serial:
-            try:
-                self._serial.close()
-            except Exception:
-                pass
-        self._serial = None
-
-    def stop(self):
-        with self._lock:
-            self._close()
-
-    @staticmethod
-    def list_ports_detailed() -> List[Tuple[str, str, Optional[int], Optional[int]]]:
-        """(device, description, vid, pid) for each COM port, sorted by name."""
-        if not HAS_PYSERIAL:
-            return []
-        ports = sorted(serial.tools.list_ports.comports(), key=lambda p: p.device)
-        return [(p.device, p.description, p.vid, p.pid) for p in ports]
-
-    @classmethod
-    def find_naviter_dongle(cls) -> Optional[str]:
-        """COM port of the first Silicon Labs CP210x device, which is what the dongle uses."""
-        for device, description, vid, pid in cls.list_ports_detailed():
-            if (vid == NAVITER_DONGLE_VID and pid == NAVITER_DONGLE_PID) or "CP210" in description:
-                return device
-        return None
-
-
-class ConsoleWriter:
-    """Prints the sentences instead of writing to a COM port (--dry-run)."""
-
-    RECONNECT_INTERVAL = 3.0
-
-    def __init__(self):
-        self.port = "console"
-        self.baudrate = 0
-
-    def start(self):
-        print("Dry run: NMEA sentences are printed, no COM port is opened.")
-
-    def is_connected(self) -> bool:
-        return True
-
-    def send_batch(self, sentences: List[str]) -> bool:
-        for s in sentences:
-            print(s)
-        return bool(sentences)
-
-    def reconnect(self):
-        pass
-
-    def stop(self):
-        pass
+            return build_flight_data(self._values, self.last_receive_time, self.vario)
 
 # ── Orchestrator ──────────────────────────────────────────────────────
 
@@ -653,7 +239,7 @@ class XPlaneToSeeYou:
             return self._injected_writer
         if self.dry_run:
             return ConsoleWriter()
-        return SerialWriter(self.com_port, self.baudrate, self.debug_level)
+        return SerialWriter(self.com_port, self.baudrate)
 
     def start_services(self):
         """Start (or restart, picking up changed settings) all background work."""
@@ -873,11 +459,11 @@ class BridgeGUI:
         self.btn_stop.pack(side="right", expand=True, padx=4)
 
     def _refresh_ports(self):
-        ports = SerialWriter.list_ports_detailed()
+        ports = list_ports_detailed()
         self._port_info = {device: description for device, description, _, _ in ports}
         names = list(self._port_info)
         self.combo_port["values"] = names
-        dongle = SerialWriter.find_naviter_dongle()
+        dongle = find_naviter_dongle()
         if self.bridge.com_port in names:
             self.combo_port.set(self.bridge.com_port)
         elif dongle:
@@ -1037,7 +623,7 @@ def main():
         sys.exit(1)
 
     if args.list_ports:
-        ports = SerialWriter.list_ports_detailed()
+        ports = list_ports_detailed()
         if not ports:
             print("No COM ports found.")
         for device, description, _, _ in ports:
@@ -1048,7 +634,7 @@ def main():
     saved = load_settings()
     com_port = args.com_port or saved.get("com_port")
     if not com_port:
-        com_port = (SerialWriter.find_naviter_dongle() if HAS_PYSERIAL else None) or DEFAULT_COM_PORT
+        com_port = (find_naviter_dongle() if HAS_PYSERIAL else None) or DEFAULT_COM_PORT
 
     bridge = XPlaneToSeeYou(
         xp_host=args.xp_host or saved.get("xp_host") or DEFAULT_XP_HOST,
